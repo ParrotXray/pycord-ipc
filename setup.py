@@ -74,13 +74,12 @@ if init_file.exists():
         else:
             raise RuntimeError("Cannot find version string in __init__.py")
 else:
-    version = "0.1.0"
+    version = "0.1.1"
 
 if "dev" in version or "alpha" in version or "beta" in version or "rc" in version:
     try:
         import subprocess
         
-        # Get commit count
         process = subprocess.Popen(
             ["git", "rev-list", "--count", "HEAD"], 
             stdout=subprocess.PIPE,
@@ -91,7 +90,6 @@ if "dev" in version or "alpha" in version or "beta" in version or "rc" in versio
             commit_count = out.decode("utf-8").strip()
             version += f".dev{commit_count}"
 
-        # Get short hash
         process = subprocess.Popen(
             ["git", "rev-parse", "--short", "HEAD"], 
             stdout=subprocess.PIPE,
@@ -115,7 +113,7 @@ else:
     long_description_content_type = "text/plain"
 
 setuptools.setup(
-    name="pycord-ipc",
+    name="pycord-inter-process",
     version=version,
     author="ParrotXray",
     author_email="",
