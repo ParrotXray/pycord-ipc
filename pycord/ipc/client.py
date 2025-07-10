@@ -5,6 +5,7 @@ Modern IPC Client with auto-reconnection and rate limiting
 import asyncio
 import logging
 import time
+import weakref
 from typing import Optional, Dict, Any, Union, Tuple
 from collections import deque
 
@@ -102,6 +103,10 @@ class Client:
         self.multicast: Optional[aiohttp.ClientWebSocketResponse] = None
         self._connected = False
         self._connection_lock = asyncio.Lock()
+        self._reconnecting = False
+        self._closed = False
+        
+        self._active_tasks: weakref.WeakSet = weakref.WeakSet()
 
     @property
     def url(self) -> str:
@@ -112,7 +117,12 @@ class Client:
     @property
     def connected(self) -> bool:
         """Check if client is connected"""
-        return self._connected and self.websocket and not self.websocket.closed
+        return (
+            self._connected and 
+            self.websocket and 
+            not self.websocket.closed and 
+            not self._closed
+        )
 
     async def __aenter__(self) -> "Client":
         """Async context manager entry"""
@@ -125,15 +135,24 @@ class Client:
 
     async def connect(self) -> None:
         """Connect to the IPC server"""
+        if self._closed:
+            raise NotConnected("Client has been closed")
+            
         async with self._connection_lock:
             if self.connected:
                 return
                 
-            await self._init_session()
-            await self._init_websocket()
-            self._connected = True
-            self._reconnect_attempts = 0
-            log.info("Connected to IPC server at %s", self.url)
+            try:
+                await self._init_session()
+                await self._init_websocket()
+                self._connected = True
+                self._reconnect_attempts = 0
+                self._reconnecting = False
+                log.info("Connected to IPC server at %s", self.url)
+            except Exception as e:
+                log.error("Failed to connect to IPC server: %s", e)
+                await self._cleanup_connection()
+                raise
 
     async def _init_session(self) -> None:
         """Initialize aiohttp session"""
@@ -141,7 +160,10 @@ class Client:
             await self.session.close()
             
         timeout = aiohttp.ClientTimeout(total=self.connection_timeout)
-        self.session = aiohttp.ClientSession(timeout=timeout)
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(limit=10, limit_per_host=10)
+        )
 
     async def _init_websocket(self) -> None:
         """Initialize WebSocket connection with port discovery if needed"""
@@ -154,9 +176,10 @@ class Client:
 
             self.websocket = await self.session.ws_connect(
                 self.url,
-                autoping=False,
-                autoclose=False,
-                timeout=self.connection_timeout
+                autoping=True,
+                autoclose=True,
+                timeout=self.connection_timeout,
+                heartbeat=30
             )
             
         except asyncio.TimeoutError:
@@ -203,50 +226,87 @@ class Client:
             raise ConnectionTimeout(self.connection_timeout, "multicast discovery")
         finally:
             if self.multicast:
-                await self.multicast.close()
+                await self._safe_close_websocket(self.multicast)
+                self.multicast = None
 
-    async def close(self) -> None:
-        """Close the connection and cleanup resources"""
+    async def _safe_close_websocket(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Safely close a websocket connection"""
+        try:
+            if not ws.closed:
+                await ws.close()
+        except Exception as e:
+            log.debug("Error closing websocket: %s", e)
+
+    async def _cleanup_connection(self) -> None:
+        """Clean up connection resources"""
         self._connected = False
         
         if self.websocket:
-            await self.websocket.close()
+            await self._safe_close_websocket(self.websocket)
             self.websocket = None
             
         if self.multicast:
-            await self.multicast.close()
+            await self._safe_close_websocket(self.multicast)
             self.multicast = None
+
+    async def close(self) -> None:
+        """Close the connection and cleanup resources"""
+        if self._closed:
+            return
             
-        if self.session:
+        self._closed = True
+        self._connected = False
+        self._reconnecting = False
+        
+        for task in list(self._active_tasks):
+            if not task.done():
+                task.cancel()
+        
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+        
+        await self._cleanup_connection()
+        
+        if self.session and not self.session.closed:
             await self.session.close()
             self.session = None
             
         log.info("IPC client connection closed")
 
     async def _handle_reconnection(self) -> None:
-        """Handle automatic reconnection logic"""
-        if not self.auto_reconnect:
+        """Handle automatic reconnection logic with proper task management"""
+        if not self.auto_reconnect or self._closed or self._reconnecting:
             return
             
-        if self.max_reconnect_attempts > 0 and self._reconnect_attempts >= self.max_reconnect_attempts:
-            log.error("Max reconnection attempts (%d) reached", self.max_reconnect_attempts)
-            return
-            
-        self._reconnect_attempts += 1
-        log.info("Attempting reconnection %d/%d in %.1fs", 
-                self._reconnect_attempts, 
-                self.max_reconnect_attempts or float('inf'),
-                self.reconnect_delay)
-        
-        await asyncio.sleep(self.reconnect_delay)
+        self._reconnecting = True
         
         try:
-            await self.connect()
-            log.info("Reconnection successful")
-        except Exception as e:
-            log.error("Reconnection failed: %s", e)
-            if self.auto_reconnect:
-                await self._handle_reconnection()
+            if self.max_reconnect_attempts > 0 and self._reconnect_attempts >= self.max_reconnect_attempts:
+                log.error("Max reconnection attempts (%d) reached", self.max_reconnect_attempts)
+                return
+                
+            self._reconnect_attempts += 1
+            log.info("Attempting reconnection %d/%d in %.1fs", 
+                    self._reconnect_attempts, 
+                    self.max_reconnect_attempts or float('inf'),
+                    self.reconnect_delay)
+            
+            await asyncio.sleep(self.reconnect_delay)
+            
+            if self._closed:
+                return
+                
+            try:
+                await self.connect()
+                log.info("Reconnection successful")
+            except Exception as e:
+                log.error("Reconnection failed: %s", e)
+
+                if self.auto_reconnect and not self._closed:
+                    task = asyncio.create_task(self._handle_reconnection())
+                    self._active_tasks.add(task)
+        finally:
+            self._reconnecting = False
 
     async def request(self, endpoint: str, **kwargs) -> Dict[str, Any]:
         """
@@ -273,10 +333,14 @@ class Client:
         ConnectionTimeout
             If request times out
         """
+
+        if self._closed:
+            raise NotConnected("Client has been closed")
+            
         await self.rate_limiter.acquire()
         
         if not self.connected:
-            if self.auto_reconnect:
+            if self.auto_reconnect and not self._reconnecting:
                 await self.connect()
             else:
                 raise NotConnected("Not connected to server")
@@ -291,7 +355,10 @@ class Client:
 
         try:
             await self.websocket.send_json(payload)
-            recv = await self.websocket.receive()
+            recv = await asyncio.wait_for(
+                self.websocket.receive(),
+                timeout=self.connection_timeout
+            )
             
             if recv.type == aiohttp.WSMsgType.PING:
                 log.debug("Received PING, sending PONG")
@@ -306,11 +373,14 @@ class Client:
                 self._connected = False
                 log.warning("WebSocket connection closed unexpectedly")
                 
-                if self.auto_reconnect:
-                    await self._handle_reconnection()
-                    return await self.request(endpoint, **kwargs)
-                else:
-                    raise NotConnected("WebSocket connection closed")
+                if self.auto_reconnect and not self._closed:
+                    task = asyncio.create_task(self._handle_reconnection())
+                    self._active_tasks.add(task)
+                    await task
+                    if self.connected:
+                        return await self.request(endpoint, **kwargs)
+                
+                raise NotConnected("WebSocket connection closed")
                     
             elif recv.type == aiohttp.WSMsgType.ERROR:
                 raise ServerConnectionRefusedError(
@@ -338,16 +408,31 @@ class Client:
             
             return response
             
+        except asyncio.TimeoutError:
+            raise ConnectionTimeout(self.connection_timeout, "request")
         except aiohttp.ClientError as e:
             self._connected = False
             log.error("Client error during request: %s", e)
             
-            if self.auto_reconnect:
-                await self._handle_reconnection()
-                return await self.request(endpoint, **kwargs)
-            else:
-                raise ServerConnectionRefusedError(
-                    self.host, 
-                    self.port or self.multicast_port, 
-                    str(e)
-                )
+            if self.auto_reconnect and not self._closed:
+                task = asyncio.create_task(self._handle_reconnection())
+                self._active_tasks.add(task)
+                await task
+                if self.connected:
+                    return await self.request(endpoint, **kwargs)
+            
+            raise ServerConnectionRefusedError(
+                self.host, 
+                self.port or self.multicast_port, 
+                str(e)
+            )
+
+    def __del__(self) -> None:
+        """Cleanup on deletion"""
+        if not self._closed and self.session and not self.session.closed:
+            try:
+                loop = asyncio.get_event_loop()
+                if not loop.is_closed():
+                    loop.create_task(self.close())
+            except Exception:
+                pass
