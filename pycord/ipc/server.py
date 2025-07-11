@@ -279,7 +279,7 @@ class Server:
                 arguments = (server_response,)
 
             result = await self.endpoints[endpoint](*arguments)
-            return result if result is not None else {"success": True}
+            return result
             
         except Exception as error:
             log.error("Error executing endpoint '%s': %s", endpoint, error)
