@@ -5,11 +5,12 @@ Modern IPC Server with rate limiting and graceful shutdown
 import asyncio
 import logging
 import time
-import discord
-from typing import Optional, Dict, Any, Callable, Union, Set
 from collections import defaultdict, deque
+from typing import Any, Callable, Dict, Optional, Set, Union
 
 import aiohttp.web
+import discord
+
 from .errors import *
 
 log = logging.getLogger(__name__)
@@ -25,21 +26,23 @@ def route(name: Optional[str] = None) -> Callable:
     name: Optional[str]
         The endpoint name. If not provided the method name will be used.
     """
+
     def decorator(func: Callable) -> Callable:
         endpoint_name = name if name is not None else func.__name__
         Server.ROUTES[endpoint_name] = func
         return func
+
     return decorator
 
 
 class IpcServerResponse:
     """Represents a request to an IPC server endpoint"""
-    
+
     def __init__(self, data: Dict[str, Any]) -> None:
         self._json = data
         self.length = len(str(data))
         self.endpoint: str = data["endpoint"]
-        
+
         for key, value in data["data"].items():
             setattr(self, key, value)
 
@@ -56,16 +59,16 @@ class IpcServerResponse:
 
 class ServerRateLimiter:
     """Rate limiter for server endpoints"""
-    
+
     def __init__(self, max_requests: int, window_seconds: int) -> None:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.client_requests: Dict[str, deque] = defaultdict(deque)
-    
+
     def check_rate_limit(self, client_id: str) -> Optional[float]:
         """
         Check if client is rate limited
-        
+
         Returns
         -------
         Optional[float]
@@ -133,10 +136,10 @@ class Server:
         websocket_timeout: float = 300.0,
         websocket_receive_timeout: float = 300.0,
         websocket_heartbeat: float = 60.0,
-        max_message_size: int = 10 * 1024 * 1024
+        max_message_size: int = 10 * 1024 * 1024,
     ) -> None:
         self.bot = bot
-        self.loop = bot.loop if hasattr(bot, 'loop') else asyncio.get_event_loop()
+        self.loop = bot.loop if hasattr(bot, "loop") else asyncio.get_event_loop()
 
         self.secret_key = secret_key
         self.host = host
@@ -178,10 +181,12 @@ class Server:
         name: Optional[str]
             The endpoint name. If not provided the method name will be used.
         """
+
         def decorator(func: Callable) -> Callable:
             endpoint_name = name if name is not None else func.__name__
             self.endpoints[endpoint_name] = func
             return func
+
         return decorator
 
     def update_endpoints(self) -> None:
@@ -194,7 +199,7 @@ class Server:
         Handles websocket requests from the client process.
         """
         self.update_endpoints()
-        
+
         # 修改：增加更長的心跳和更大的消息限制
         websocket = aiohttp.web.WebSocketResponse(
             heartbeat=self.websocket_heartbeat,
@@ -203,13 +208,13 @@ class Server:
             max_msg_size=self.max_message_size,
             autoping=True,
             autoclose=True,
-            compress=True
+            compress=True,
         )
         await websocket.prepare(request)
 
         self._active_connections.add(websocket)
         client_id = f"{request.remote}:{id(websocket)}"
-        
+
         log.info("New IPC connection from %s", request.remote)
 
         try:
@@ -218,86 +223,82 @@ class Server:
                     try:
                         request_data = message.json()
                     except ValueError:
-                        await websocket.send_json({
-                            "error": "Invalid JSON",
-                            "code": 400
-                        })
+                        await websocket.send_json({"error": "Invalid JSON", "code": 400})
                         continue
-                        
+
                     log.debug("IPC Server < %r", request_data)
-                    
+
                     try:
                         response = await asyncio.wait_for(
                             self._process_request(request_data, client_id),
-                            timeout=self.websocket_timeout
+                            timeout=self.websocket_timeout,
                         )
                     except asyncio.TimeoutError:
-                        response = {
-                            "error": "Request processing timeout",
-                            "code": 408
-                        }
-                        log.error("Request processing timeout for endpoint: %s", 
-                                request_data.get("endpoint", "unknown"))
-                    
+                        response = {"error": "Request processing timeout", "code": 408}
+                        log.error(
+                            "Request processing timeout for endpoint: %s",
+                            request_data.get("endpoint", "unknown"),
+                        )
+
                     try:
                         await websocket.send_json(response)
                         log.debug("IPC Server > %r", response)
                     except TypeError as error:
                         await self._handle_json_error(websocket, error)
-                        
+
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     exception = websocket.exception()
-                    log.error("WebSocket error from %s: %s (%s)", 
-                             request.remote, 
-                             exception if exception else "Unknown error",
-                             type(exception).__name__ if exception else "Unknown")
+                    log.error(
+                        "WebSocket error from %s: %s (%s)",
+                        request.remote,
+                        exception if exception else "Unknown error",
+                        type(exception).__name__ if exception else "Unknown",
+                    )
                     break
-                    
+
         except Exception as e:
-            log.error("Unexpected error in websocket handler from %s: %s (%s)", 
-                     request.remote, e, type(e).__name__)
+            log.error(
+                "Unexpected error in websocket handler from %s: %s (%s)",
+                request.remote,
+                e,
+                type(e).__name__,
+            )
         finally:
             self._active_connections.discard(websocket)
             log.info("IPC connection closed from %s", request.remote)
 
         return websocket
 
-    async def _process_request(self, request_data: Dict[str, Any], client_id: str) -> Dict[str, Any]:
+    async def _process_request(
+        self, request_data: Dict[str, Any], client_id: str
+    ) -> Dict[str, Any]:
         """Process an individual IPC request"""
 
         retry_after = self.rate_limiter.check_rate_limit(client_id)
         if retry_after is not None:
-            return {
-                "error": "Rate limit exceeded",
-                "code": 429,
-                "retry_after": retry_after
-            }
+            return {"error": "Rate limit exceeded", "code": 429, "retry_after": retry_after}
 
         headers = request_data.get("headers", {})
         if not headers or headers.get("Authorization") != self.secret_key:
             log.warning("Unauthorized request from %s", client_id)
-            return {
-                "error": "Invalid or no token provided",
-                "code": 403
-            }
+            return {"error": "Invalid or no token provided", "code": 403}
 
         endpoint = request_data.get("endpoint")
         if not endpoint or endpoint not in self.endpoints:
             log.warning("Invalid endpoint '%s' requested from %s", endpoint, client_id)
-            return {
-                "error": "Invalid or no endpoint given",
-                "code": 404
-            }
+            return {"error": "Invalid or no endpoint given", "code": 404}
 
         try:
             server_response = IpcServerResponse(request_data)
-            
+
             try:
                 qualname_parts = self.endpoints[endpoint].__qualname__.split(".")
                 if len(qualname_parts) > 1:
                     cog_name = qualname_parts[0]
-                    attempted_cls = self.bot.cogs.get(cog_name) if hasattr(self.bot, 'cogs') else None
-                    
+                    attempted_cls = (
+                        self.bot.cogs.get(cog_name) if hasattr(self.bot, "cogs") else None
+                    )
+
                     if attempted_cls:
                         arguments = (attempted_cls, server_response)
                     else:
@@ -309,22 +310,26 @@ class Server:
 
             result = await self.endpoints[endpoint](*arguments)
             return result
-            
+
         except Exception as error:
             log.error("Error executing endpoint '%s': %s", endpoint, error)
 
-            if hasattr(self.bot, 'dispatch'):
+            if hasattr(self.bot, "dispatch"):
                 self.bot.dispatch("ipc_error", endpoint, error)
 
             return {
                 "error": f"IPC route raised error of type {type(error).__name__}",
                 "code": 500,
-                "details": str(error) if log.level <= logging.DEBUG else None
+                "details": str(error) if log.level <= logging.DEBUG else None,
             }
 
-    async def _handle_json_error(self, websocket: aiohttp.web.WebSocketResponse, error: TypeError) -> None:
+    async def _handle_json_error(
+        self, websocket: aiohttp.web.WebSocketResponse, error: TypeError
+    ) -> None:
         """Handle JSON serialization errors"""
-        if str(error).startswith("Object of type") and str(error).endswith("is not JSON serializable"):
+        if str(error).startswith("Object of type") and str(error).endswith(
+            "is not JSON serializable"
+        ):
             error_response = (
                 "IPC route returned values which are not able to be sent over sockets. "
                 "If you are trying to send a discord.py object, please only send the data you need."
@@ -356,10 +361,7 @@ class Server:
                     try:
                         request_data = message.json()
                     except ValueError:
-                        await websocket.send_json({
-                            "error": "Invalid JSON",
-                            "code": 400
-                        })
+                        await websocket.send_json({"error": "Invalid JSON", "code": 400})
                         continue
 
                     log.debug("Multicast Server < %r", request_data)
@@ -377,15 +379,17 @@ class Server:
                     log.debug("Multicast Server > %r", response)
                     await websocket.send_json(response)
                     break
-                    
+
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     exception = websocket.exception()
-                    log.error("Multicast WebSocket error from %s: %s (%s)", 
-                             request.remote,
-                             exception if exception else "Unknown error",
-                             type(exception).__name__ if exception else "Unknown")
+                    log.error(
+                        "Multicast WebSocket error from %s: %s (%s)",
+                        request.remote,
+                        exception if exception else "Unknown error",
+                        type(exception).__name__ if exception else "Unknown",
+                    )
                     break
-                    
+
         except Exception as e:
             log.error("Unexpected error in multicast handler: %s", e)
 
@@ -411,9 +415,7 @@ class Server:
                 self._multicast_runner = aiohttp.web.AppRunner(self._multicast_server)
                 await self._multicast_runner.setup()
                 self._multicast_site = aiohttp.web.TCPSite(
-                    self._multicast_runner, 
-                    self.host, 
-                    self.multicast_port
+                    self._multicast_runner, self.host, self.multicast_port
                 )
                 await self._multicast_site.start()
 
@@ -424,9 +426,9 @@ class Server:
 
             self._running = True
 
-            if hasattr(self.bot, 'dispatch'):
+            if hasattr(self.bot, "dispatch"):
                 self.bot.dispatch("ipc_ready")
-                
+
             log.info("IPC server started successfully")
 
         except Exception as e:
@@ -447,18 +449,20 @@ class Server:
             close_tasks = []
             for ws in self._active_connections.copy():
                 if not ws.closed:
-                    close_tasks.append(ws.close(code=aiohttp.WSMsgType.CLOSE, message=b"Server shutting down"))
-            
+                    close_tasks.append(
+                        ws.close(code=aiohttp.WSMsgType.CLOSE, message=b"Server shutting down")
+                    )
+
             if close_tasks:
                 await asyncio.gather(*close_tasks, return_exceptions=True)
-            
+
             self._active_connections.clear()
 
         cleanup_tasks = []
-        
+
         if self._site:
             cleanup_tasks.append(self._site.stop())
-            
+
         if self._multicast_site:
             cleanup_tasks.append(self._multicast_site.stop())
 
@@ -468,7 +472,7 @@ class Server:
         if self._app_runner:
             await self._app_runner.cleanup()
             self._app_runner = None
-            
+
         if self._multicast_runner:
             await self._multicast_runner.cleanup()
             self._multicast_runner = None

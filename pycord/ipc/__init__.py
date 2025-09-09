@@ -7,8 +7,8 @@ import collections
 from typing import NamedTuple
 
 from .client import Client
-from .server import Server
 from .errors import *
+from .server import Server
 
 
 class _VersionInfo(NamedTuple):
@@ -27,7 +27,7 @@ version_info = __version_info__
 
 __all__ = [
     "Client",
-    "Server", 
+    "Server",
     "IPCError",
     "NoEndpointFoundError",
     "ServerConnectionRefusedError",
