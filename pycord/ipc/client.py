@@ -69,7 +69,11 @@ class Client:
     max_reconnect_attempts: int
         Maximum reconnection attempts (0 = infinite), defaults to 10
     connection_timeout: float
-        Connection timeout in seconds, defaults to 10.0
+        Connection timeout in seconds, defaults to 60.0
+    request_timeout: float
+        Request timeout in seconds, defaults to 300.0
+    heartbeat_interval: float
+        Heartbeat interval in seconds for WebSocket, defaults to 60.0
     """
 
     def __init__(
@@ -83,13 +87,17 @@ class Client:
         auto_reconnect: bool = True,
         reconnect_delay: float = 5.0,
         max_reconnect_attempts: int = 10,
-        connection_timeout: float = 10.0
+        connection_timeout: float = 60.0,
+        request_timeout: float = 300.0,
+        heartbeat_interval: float = 60.0
     ) -> None:
         self.host = host
         self.port = port
         self.secret_key = secret_key
         self.multicast_port = multicast_port
         self.connection_timeout = connection_timeout
+        self.request_timeout = request_timeout
+        self.heartbeat_interval = heartbeat_interval
         
         self.rate_limiter = RateLimiter(max_requests, rate_window)
         
@@ -179,7 +187,9 @@ class Client:
                 autoping=True,
                 autoclose=True,
                 timeout=self.connection_timeout,
-                heartbeat=30
+                heartbeat=self.heartbeat_interval,
+                max_msg_size=10 * 1024 * 1024, 
+                compress=15
             )
             
         except asyncio.TimeoutError:
@@ -308,7 +318,7 @@ class Client:
         finally:
             self._reconnecting = False
 
-    async def request(self, endpoint: str, **kwargs) -> Dict[str, Any]:
+    async def request(self, endpoint: str, timeout: Optional[float] = None, **kwargs) -> Dict[str, Any]:
         """
         Make a request to the IPC server process.
 
@@ -316,6 +326,8 @@ class Client:
         ----------
         endpoint: str
             The endpoint to request on the server
+        timeout: Optional[float]
+            Request timeout in seconds. If None, uses default request_timeout
         **kwargs
             The data to send to the endpoint
             
@@ -323,15 +335,6 @@ class Client:
         -------
         Dict[str, Any]
             The response from the server
-            
-        Raises
-        ------
-        RateLimited
-            If rate limit is exceeded
-        NotConnected
-            If not connected to server
-        ConnectionTimeout
-            If request times out
         """
 
         if self._closed:
@@ -345,29 +348,32 @@ class Client:
             else:
                 raise NotConnected("Not connected to server")
 
+        actual_timeout = timeout if timeout is not None else self.request_timeout
+
         payload = {
             "endpoint": endpoint,
             "data": kwargs,
             "headers": {"Authorization": self.secret_key},
         }
 
-        log.debug("Sending request to %s: %r", endpoint, kwargs)
+        log.debug("Sending request to %s: %r (timeout: %ss)", endpoint, kwargs, actual_timeout)
 
         try:
             await self.websocket.send_json(payload)
+
             recv = await asyncio.wait_for(
                 self.websocket.receive(),
-                timeout=self.connection_timeout
+                timeout=actual_timeout
             )
             
             if recv.type == aiohttp.WSMsgType.PING:
                 log.debug("Received PING, sending PONG")
                 await self.websocket.ping()
-                return await self.request(endpoint, **kwargs)
+                return await self.request(endpoint, timeout=timeout, **kwargs)
                 
             elif recv.type == aiohttp.WSMsgType.PONG:
                 log.debug("Received PONG")
-                return await self.request(endpoint, **kwargs)
+                return await self.request(endpoint, timeout=timeout, **kwargs)
                 
             elif recv.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                 self._connected = False
@@ -378,7 +384,7 @@ class Client:
                     self._active_tasks.add(task)
                     await task
                     if self.connected:
-                        return await self.request(endpoint, **kwargs)
+                        return await self.request(endpoint, timeout=timeout, **kwargs)
                 
                 raise NotConnected("WebSocket connection closed")
                     
@@ -409,7 +415,8 @@ class Client:
             return response
             
         except asyncio.TimeoutError:
-            raise ConnectionTimeout(self.connection_timeout, "request")
+            log.error("Request timeout after %ss for endpoint: %s", actual_timeout, endpoint)
+            raise ConnectionTimeout(actual_timeout, f"request to {endpoint}")
         except aiohttp.ClientError as e:
             self._connected = False
             log.error("Client error during request: %s", e)
@@ -419,7 +426,7 @@ class Client:
                 self._active_tasks.add(task)
                 await task
                 if self.connected:
-                    return await self.request(endpoint, **kwargs)
+                    return await self.request(endpoint, timeout=timeout, **kwargs)
             
             raise ServerConnectionRefusedError(
                 self.host, 

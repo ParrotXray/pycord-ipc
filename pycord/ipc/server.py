@@ -5,6 +5,7 @@ Modern IPC Server with rate limiting and graceful shutdown
 import asyncio
 import logging
 import time
+import discord
 from typing import Optional, Dict, Any, Callable, Union, Set
 from collections import defaultdict, deque
 
@@ -107,13 +108,21 @@ class Server:
         Maximum requests per client per window, defaults to 100
     rate_window: int
         Rate limiting window in seconds, defaults to 60
+    websocket_timeout: float
+        Timeout for websocket operations in seconds, defaults to 300.0
+    websocket_receive_timeout: float
+        Timeout for receiving messages in seconds, defaults to 300.0
+    websocket_heartbeat: float
+        Heartbeat interval in seconds, defaults to 60.0
+    max_message_size: int
+        Maximum message size in bytes, defaults to 10MB
     """
 
     ROUTES: Dict[str, Callable] = {}
 
     def __init__(
         self,
-        bot: Any,
+        bot: discord.Client,
         host: str = "localhost",
         port: int = 8765,
         secret_key: Optional[Union[str, bytes]] = None,
@@ -121,6 +130,10 @@ class Server:
         multicast_port: int = 20000,
         max_requests: int = 100,
         rate_window: int = 60,
+        websocket_timeout: float = 300.0,
+        websocket_receive_timeout: float = 300.0,
+        websocket_heartbeat: float = 60.0,
+        max_message_size: int = 10 * 1024 * 1024
     ) -> None:
         self.bot = bot
         self.loop = bot.loop if hasattr(bot, 'loop') else asyncio.get_event_loop()
@@ -128,6 +141,10 @@ class Server:
         self.secret_key = secret_key
         self.host = host
         self.port = port
+        self.websocket_timeout = websocket_timeout
+        self.websocket_receive_timeout = websocket_receive_timeout
+        self.websocket_heartbeat = websocket_heartbeat
+        self.max_message_size = max_message_size
 
         self._server: Optional[aiohttp.web.Application] = None
         self._multicast_server: Optional[aiohttp.web.Application] = None
@@ -175,15 +192,19 @@ class Server:
     async def handle_accept(self, request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
         """
         Handles websocket requests from the client process.
-
-        Parameters
-        ----------
-        request: aiohttp.web.Request
-            The request made by the client, parsed by aiohttp.
         """
         self.update_endpoints()
         
-        websocket = aiohttp.web.WebSocketResponse(heartbeat=30)
+        # 修改：增加更長的心跳和更大的消息限制
+        websocket = aiohttp.web.WebSocketResponse(
+            heartbeat=self.websocket_heartbeat,
+            receive_timeout=self.websocket_receive_timeout,
+            timeout=self.websocket_timeout,
+            max_msg_size=self.max_message_size,
+            autoping=True,
+            autoclose=True,
+            compress=True
+        )
         await websocket.prepare(request)
 
         self._active_connections.add(websocket)
@@ -204,7 +225,19 @@ class Server:
                         continue
                         
                     log.debug("IPC Server < %r", request_data)
-                    response = await self._process_request(request_data, client_id)
+                    
+                    try:
+                        response = await asyncio.wait_for(
+                            self._process_request(request_data, client_id),
+                            timeout=self.websocket_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        response = {
+                            "error": "Request processing timeout",
+                            "code": 408
+                        }
+                        log.error("Request processing timeout for endpoint: %s", 
+                                request_data.get("endpoint", "unknown"))
                     
                     try:
                         await websocket.send_json(response)
@@ -223,10 +256,6 @@ class Server:
         except Exception as e:
             log.error("Unexpected error in websocket handler from %s: %s (%s)", 
                      request.remote, e, type(e).__name__)
-            if hasattr(e, 'code'):
-                log.error("Error code: %s", e.code)
-            if hasattr(e, 'reason'):
-                log.error("Error reason: %s", e.reason)
         finally:
             self._active_connections.discard(websocket)
             log.info("IPC connection closed from %s", request.remote)
