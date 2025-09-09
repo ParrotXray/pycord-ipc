@@ -41,12 +41,12 @@ jobs:
 
     - name: Run black formatter
       run: |
-        black pycord/inter-process
+        black pycord/ipc
         echo "Black formatting completed"
 
     - name: Run isort import sorter
       run: |
-        isort pycord/inter-process
+        isort pycord/ipc
         echo "Import sorting completed"
 
     - name: Check for changes
@@ -63,18 +63,18 @@ jobs:
     - name: Format check with black
       run: |
         echo "Checking code formatting with black..."
-        black --check pycord/inter-process
+        black --check pycord/ipc
 
     - name: Import sorting check with isort
       run: |
         echo "Checking import sorting with isort..."
-        isort --check-only pycord/inter-process
+        isort --check-only pycord/ipc
 
     - name: Lint with flake8
       run: |
         echo "Running flake8 syntax checks..."
-        flake8 pycord/inter-process --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 pycord/inter-process --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        flake8 pycord/ipc --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 pycord/ipc --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
     - name: Verify code quality after formatting
       run: |
