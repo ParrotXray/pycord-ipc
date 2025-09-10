@@ -133,6 +133,7 @@ class Server:
 
     def route(self, name: Optional[str] = None) -> Callable:
         """Register a coroutine as an endpoint"""
+
         def decorator(func: Callable) -> Callable:
             endpoint_name = name if name is not None else func.__name__
             self.endpoints[endpoint_name] = func
@@ -184,9 +185,9 @@ class Server:
                         )
                     except asyncio.TimeoutError:
                         response = {
-                            "error": "Request processing timeout", 
+                            "error": "Request processing timeout",
                             "code": 408,
-                            "request_id": request_data.get("request_id")  # Preserve request ID
+                            "request_id": request_data.get("request_id"),  # Preserve request ID
                         }
                         log.error(
                             "Request processing timeout for endpoint: %s",
@@ -197,7 +198,9 @@ class Server:
                         await websocket.send_json(response)
                         log.debug("IPC Server > %r", response)
                     except TypeError as error:
-                        await self._handle_json_error(websocket, error, request_data.get("request_id"))
+                        await self._handle_json_error(
+                            websocket, error, request_data.get("request_id")
+                        )
 
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     exception = websocket.exception()
@@ -227,7 +230,7 @@ class Server:
     ) -> Dict[str, Any]:
         """Process an individual IPC request with request ID preservation"""
         request_id = request_data.get("request_id")
-        
+
         # Base response with request ID
         base_response = {"request_id": request_id} if request_id else {}
 
@@ -235,28 +238,20 @@ class Server:
         if retry_after is not None:
             return {
                 **base_response,
-                "error": "Rate limit exceeded", 
-                "code": 429, 
-                "retry_after": retry_after
+                "error": "Rate limit exceeded",
+                "code": 429,
+                "retry_after": retry_after,
             }
 
         headers = request_data.get("headers", {})
         if not headers or headers.get("Authorization") != self.secret_key:
             log.warning("Unauthorized request from %s", client_id)
-            return {
-                **base_response,
-                "error": "Invalid or no token provided", 
-                "code": 403
-            }
+            return {**base_response, "error": "Invalid or no token provided", "code": 403}
 
         endpoint = request_data.get("endpoint")
         if not endpoint or endpoint not in self.endpoints:
             log.warning("Invalid endpoint '%s' requested from %s", endpoint, client_id)
-            return {
-                **base_response,
-                "error": "Invalid or no endpoint given", 
-                "code": 404
-            }
+            return {**base_response, "error": "Invalid or no endpoint given", "code": 404}
 
         try:
             server_response = IpcServerResponse(request_data)
@@ -279,11 +274,11 @@ class Server:
                 arguments = (server_response,)
 
             result = await self.endpoints[endpoint](*arguments)
-            
+
             # Ensure result is a dict and add request ID
             if not isinstance(result, dict):
                 result = {"data": result}
-            
+
             return {**base_response, **result}
 
         except Exception as error:
@@ -300,7 +295,10 @@ class Server:
             }
 
     async def _handle_json_error(
-        self, websocket: aiohttp.web.WebSocketResponse, error: TypeError, request_id: Optional[str] = None
+        self,
+        websocket: aiohttp.web.WebSocketResponse,
+        error: TypeError,
+        request_id: Optional[str] = None,
     ) -> None:
         """Handle JSON serialization errors with request ID preservation"""
         if str(error).startswith("Object of type") and str(error).endswith(
@@ -312,13 +310,10 @@ class Server:
             )
             log.error(error_response)
 
-            response = {
-                "error": error_response, 
-                "code": 500
-            }
+            response = {"error": error_response, "code": 500}
             if request_id:
                 response["request_id"] = request_id
-                
+
             await websocket.send_json(response)
             log.debug("IPC Server > %r", response)
 
