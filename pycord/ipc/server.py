@@ -1,5 +1,5 @@
 """
-Modern IPC Server with rate limiting and graceful shutdown
+Enhanced IPC Server with request ID support to prevent response mixing
 """
 
 import asyncio
@@ -20,11 +20,6 @@ def route(name: Optional[str] = None) -> Callable:
     """
     Used to register a coroutine as an endpoint when you don't have
     access to an instance of :class:`.Server`
-
-    Parameters
-    ----------
-    name: Optional[str]
-        The endpoint name. If not provided the method name will be used.
     """
 
     def decorator(func: Callable) -> Callable:
@@ -42,6 +37,7 @@ class IpcServerResponse:
         self._json = data
         self.length = len(str(data))
         self.endpoint: str = data["endpoint"]
+        self.request_id: Optional[str] = data.get("request_id")  # Add request ID
 
         for key, value in data["data"].items():
             setattr(self, key, value)
@@ -51,7 +47,7 @@ class IpcServerResponse:
         return self._json
 
     def __repr__(self) -> str:
-        return f"<IpcServerResponse endpoint={self.endpoint} length={self.length}>"
+        return f"<IpcServerResponse endpoint={self.endpoint} request_id={self.request_id} length={self.length}>"
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -66,14 +62,7 @@ class ServerRateLimiter:
         self.client_requests: Dict[str, deque] = defaultdict(deque)
 
     def check_rate_limit(self, client_id: str) -> Optional[float]:
-        """
-        Check if client is rate limited
-
-        Returns
-        -------
-        Optional[float]
-            Retry after time in seconds if rate limited, None otherwise
-        """
+        """Check if client is rate limited"""
         now = time.time()
         requests = self.client_requests[client_id]
 
@@ -90,36 +79,7 @@ class ServerRateLimiter:
 
 
 class Server:
-    """
-    The IPC server for receiving requests from clients.
-
-    Parameters
-    ----------
-    bot: Any
-        Your bot instance (discord.py Bot or similar)
-    host: str
-        The host to run the IPC Server on, defaults to localhost
-    port: int
-        The port to run the IPC Server on, defaults to 8765
-    secret_key: Optional[Union[str, bytes]]
-        A secret key for authentication
-    do_multicast: bool
-        Turn multicasting on/off, defaults to True
-    multicast_port: int
-        The port to run the multicasting server on, defaults to 20000
-    max_requests: int
-        Maximum requests per client per window, defaults to 100
-    rate_window: int
-        Rate limiting window in seconds, defaults to 60
-    websocket_timeout: float
-        Timeout for websocket operations in seconds, defaults to 300.0
-    websocket_receive_timeout: float
-        Timeout for receiving messages in seconds, defaults to 300.0
-    websocket_heartbeat: float
-        Heartbeat interval in seconds, defaults to 60.0
-    max_message_size: int
-        Maximum message size in bytes, defaults to 10MB
-    """
+    """Enhanced IPC Server with request ID support"""
 
     ROUTES: Dict[str, Callable] = {}
 
@@ -172,16 +132,7 @@ class Server:
         return self._running
 
     def route(self, name: Optional[str] = None) -> Callable:
-        """
-        Used to register a coroutine as an endpoint when you have
-        access to an instance of :class:`.Server`.
-
-        Parameters
-        ----------
-        name: Optional[str]
-            The endpoint name. If not provided the method name will be used.
-        """
-
+        """Register a coroutine as an endpoint"""
         def decorator(func: Callable) -> Callable:
             endpoint_name = name if name is not None else func.__name__
             self.endpoints[endpoint_name] = func
@@ -195,12 +146,9 @@ class Server:
         self.ROUTES = {}
 
     async def handle_accept(self, request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
-        """
-        Handles websocket requests from the client process.
-        """
+        """Handles websocket requests from the client process."""
         self.update_endpoints()
 
-        # 修改：增加更長的心跳和更大的消息限制
         websocket = aiohttp.web.WebSocketResponse(
             heartbeat=self.websocket_heartbeat,
             receive_timeout=self.websocket_receive_timeout,
@@ -223,7 +171,8 @@ class Server:
                     try:
                         request_data = message.json()
                     except ValueError:
-                        await websocket.send_json({"error": "Invalid JSON", "code": 400})
+                        error_response = {"error": "Invalid JSON", "code": 400}
+                        await websocket.send_json(error_response)
                         continue
 
                     log.debug("IPC Server < %r", request_data)
@@ -234,7 +183,11 @@ class Server:
                             timeout=self.websocket_timeout,
                         )
                     except asyncio.TimeoutError:
-                        response = {"error": "Request processing timeout", "code": 408}
+                        response = {
+                            "error": "Request processing timeout", 
+                            "code": 408,
+                            "request_id": request_data.get("request_id")  # Preserve request ID
+                        }
                         log.error(
                             "Request processing timeout for endpoint: %s",
                             request_data.get("endpoint", "unknown"),
@@ -244,7 +197,7 @@ class Server:
                         await websocket.send_json(response)
                         log.debug("IPC Server > %r", response)
                     except TypeError as error:
-                        await self._handle_json_error(websocket, error)
+                        await self._handle_json_error(websocket, error, request_data.get("request_id"))
 
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     exception = websocket.exception()
@@ -272,21 +225,38 @@ class Server:
     async def _process_request(
         self, request_data: Dict[str, Any], client_id: str
     ) -> Dict[str, Any]:
-        """Process an individual IPC request"""
+        """Process an individual IPC request with request ID preservation"""
+        request_id = request_data.get("request_id")
+        
+        # Base response with request ID
+        base_response = {"request_id": request_id} if request_id else {}
 
         retry_after = self.rate_limiter.check_rate_limit(client_id)
         if retry_after is not None:
-            return {"error": "Rate limit exceeded", "code": 429, "retry_after": retry_after}
+            return {
+                **base_response,
+                "error": "Rate limit exceeded", 
+                "code": 429, 
+                "retry_after": retry_after
+            }
 
         headers = request_data.get("headers", {})
         if not headers or headers.get("Authorization") != self.secret_key:
             log.warning("Unauthorized request from %s", client_id)
-            return {"error": "Invalid or no token provided", "code": 403}
+            return {
+                **base_response,
+                "error": "Invalid or no token provided", 
+                "code": 403
+            }
 
         endpoint = request_data.get("endpoint")
         if not endpoint or endpoint not in self.endpoints:
             log.warning("Invalid endpoint '%s' requested from %s", endpoint, client_id)
-            return {"error": "Invalid or no endpoint given", "code": 404}
+            return {
+                **base_response,
+                "error": "Invalid or no endpoint given", 
+                "code": 404
+            }
 
         try:
             server_response = IpcServerResponse(request_data)
@@ -309,7 +279,12 @@ class Server:
                 arguments = (server_response,)
 
             result = await self.endpoints[endpoint](*arguments)
-            return result
+            
+            # Ensure result is a dict and add request ID
+            if not isinstance(result, dict):
+                result = {"data": result}
+            
+            return {**base_response, **result}
 
         except Exception as error:
             log.error("Error executing endpoint '%s': %s", endpoint, error)
@@ -318,15 +293,16 @@ class Server:
                 self.bot.dispatch("ipc_error", endpoint, error)
 
             return {
+                **base_response,
                 "error": f"IPC route raised error of type {type(error).__name__}",
                 "code": 500,
                 "details": str(error) if log.level <= logging.DEBUG else None,
             }
 
     async def _handle_json_error(
-        self, websocket: aiohttp.web.WebSocketResponse, error: TypeError
+        self, websocket: aiohttp.web.WebSocketResponse, error: TypeError, request_id: Optional[str] = None
     ) -> None:
-        """Handle JSON serialization errors"""
+        """Handle JSON serialization errors with request ID preservation"""
         if str(error).startswith("Object of type") and str(error).endswith(
             "is not JSON serializable"
         ):
@@ -336,21 +312,20 @@ class Server:
             )
             log.error(error_response)
 
-            response = {"error": error_response, "code": 500}
+            response = {
+                "error": error_response, 
+                "code": 500
+            }
+            if request_id:
+                response["request_id"] = request_id
+                
             await websocket.send_json(response)
             log.debug("IPC Server > %r", response)
 
             raise JSONEncodeError(str(type(error)), error_response)
 
     async def handle_multicast(self, request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
-        """
-        Handles multicasting websocket requests from the client.
-
-        Parameters
-        ----------
-        request: aiohttp.web.Request
-            The request made by the client, parsed by aiohttp.
-        """
+        """Handles multicasting websocket requests from the client."""
         log.info("Multicast connection from %s", request.remote)
         websocket = aiohttp.web.WebSocketResponse()
         await websocket.prepare(request)

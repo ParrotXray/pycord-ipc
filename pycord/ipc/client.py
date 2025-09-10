@@ -1,10 +1,11 @@
 """
-Modern IPC Client with auto-reconnection and rate limiting
+Enhanced IPC Client with request ID matching to prevent response mixing
 """
 
 import asyncio
 import logging
 import time
+import uuid
 import weakref
 from collections import deque
 from typing import Any, Dict, Optional, Tuple, Union
@@ -47,34 +48,7 @@ class RateLimiter:
 
 class Client:
     """
-    Handles webserver side requests to the bot process with modern features.
-
-    Parameters
-    ----------
-    host: str
-        The IP or host of the IPC server, defaults to localhost
-    port: Optional[int]
-        The port of the IPC server. If not supplied the port will be found automatically
-    secret_key: Optional[Union[str, bytes]]
-        The secret key for your IPC server. Must match the server secret_key
-    multicast_port: int
-        The port for multicast discovery, defaults to 20000
-    max_requests: int
-        Maximum requests per window for rate limiting, defaults to 100
-    rate_window: int
-        Rate limiting window in seconds, defaults to 60
-    auto_reconnect: bool
-        Whether to automatically reconnect on connection loss, defaults to True
-    reconnect_delay: float
-        Delay between reconnection attempts in seconds, defaults to 5.0
-    max_reconnect_attempts: int
-        Maximum reconnection attempts (0 = infinite), defaults to 10
-    connection_timeout: float
-        Connection timeout in seconds, defaults to 60.0
-    request_timeout: float
-        Request timeout in seconds, defaults to 300.0
-    heartbeat_interval: float
-        Heartbeat interval in seconds for WebSocket, defaults to 60.0
+    Enhanced IPC Client with request ID matching to prevent response mixing
     """
 
     def __init__(
@@ -116,6 +90,10 @@ class Client:
         self._closed = False
 
         self._active_tasks: weakref.WeakSet = weakref.WeakSet()
+        
+        # Enhanced: Request tracking
+        self._pending_requests: Dict[str, asyncio.Future] = {}
+        self._message_handler_task: Optional[asyncio.Task] = None
 
     @property
     def url(self) -> str:
@@ -149,6 +127,11 @@ class Client:
             try:
                 await self._init_session()
                 await self._init_websocket()
+                
+                # Start message handler
+                self._message_handler_task = asyncio.create_task(self._handle_messages())
+                self._active_tasks.add(self._message_handler_task)
+                
                 self._connected = True
                 self._reconnect_attempts = 0
                 self._reconnecting = False
@@ -226,6 +209,57 @@ class Client:
                 await self._safe_close_websocket(self.multicast)
                 self.multicast = None
 
+    async def _handle_messages(self) -> None:
+        """Handle incoming WebSocket messages with request ID matching"""
+        try:
+            async for message in self.websocket:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        response = message.json()
+                        log.debug("Received response: %r", response)
+                        
+                        # Extract request ID from response
+                        request_id = response.get("request_id")
+                        if request_id and request_id in self._pending_requests:
+                            future = self._pending_requests.pop(request_id)
+                            if not future.done():
+                                future.set_result(response)
+                        else:
+                            log.warning("Received response with unknown or missing request_id: %s", request_id)
+                            
+                    except ValueError as e:
+                        log.error("Failed to parse JSON response: %s", e)
+                        
+                elif message.type == aiohttp.WSMsgType.PING:
+                    log.debug("Received PING, sending PONG")
+                    await self.websocket.ping()
+                    
+                elif message.type == aiohttp.WSMsgType.PONG:
+                    log.debug("Received PONG")
+                    
+                elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    log.warning("WebSocket connection closed")
+                    self._connected = False
+                    
+                    # Cancel all pending requests
+                    for request_id, future in self._pending_requests.items():
+                        if not future.done():
+                            future.set_exception(NotConnected("WebSocket connection closed"))
+                    self._pending_requests.clear()
+                    
+                    if self.auto_reconnect and not self._closed:
+                        task = asyncio.create_task(self._handle_reconnection())
+                        self._active_tasks.add(task)
+                    break
+                    
+                elif message.type == aiohttp.WSMsgType.ERROR:
+                    log.error("WebSocket error: %s", message.data)
+                    break
+                    
+        except Exception as e:
+            log.error("Error in message handler: %s", e)
+            self._connected = False
+
     async def _safe_close_websocket(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Safely close a websocket connection"""
         try:
@@ -237,6 +271,20 @@ class Client:
     async def _cleanup_connection(self) -> None:
         """Clean up connection resources"""
         self._connected = False
+        
+        # Cancel message handler
+        if self._message_handler_task and not self._message_handler_task.done():
+            self._message_handler_task.cancel()
+            try:
+                await self._message_handler_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Cancel all pending requests
+        for request_id, future in self._pending_requests.items():
+            if not future.done():
+                future.set_exception(NotConnected("Connection lost"))
+        self._pending_requests.clear()
 
         if self.websocket:
             await self._safe_close_websocket(self.websocket)
@@ -271,7 +319,7 @@ class Client:
         log.info("IPC client connection closed")
 
     async def _handle_reconnection(self) -> None:
-        """Handle automatic reconnection logic with proper task management"""
+        """Handle automatic reconnection logic"""
         if not self.auto_reconnect or self._closed or self._reconnecting:
             return
 
@@ -314,23 +362,8 @@ class Client:
         self, endpoint: str, timeout: Optional[float] = None, **kwargs
     ) -> Dict[str, Any]:
         """
-        Make a request to the IPC server process.
-
-        Parameters
-        ----------
-        endpoint: str
-            The endpoint to request on the server
-        timeout: Optional[float]
-            Request timeout in seconds. If None, uses default request_timeout
-        **kwargs
-            The data to send to the endpoint
-
-        Returns
-        -------
-        Dict[str, Any]
-            The response from the server
+        Make a request to the IPC server process with request ID tracking.
         """
-
         if self._closed:
             raise NotConnected("Client has been closed")
 
@@ -343,50 +376,31 @@ class Client:
                 raise NotConnected("Not connected to server")
 
         actual_timeout = timeout if timeout is not None else self.request_timeout
+        
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
 
         payload = {
+            "request_id": request_id,  # Add request ID
             "endpoint": endpoint,
             "data": kwargs,
             "headers": {"Authorization": self.secret_key},
         }
 
-        log.debug("Sending request to %s: %r (timeout: %ss)", endpoint, kwargs, actual_timeout)
+        log.debug("Sending request to %s: %r (timeout: %ss, request_id: %s)", 
+                 endpoint, kwargs, actual_timeout, request_id)
+
+        # Create future for this request
+        future = asyncio.Future()
+        self._pending_requests[request_id] = future
 
         try:
             await self.websocket.send_json(payload)
-
-            recv = await asyncio.wait_for(self.websocket.receive(), timeout=actual_timeout)
-
-            if recv.type == aiohttp.WSMsgType.PING:
-                log.debug("Received PING, sending PONG")
-                await self.websocket.ping()
-                return await self.request(endpoint, timeout=timeout, **kwargs)
-
-            elif recv.type == aiohttp.WSMsgType.PONG:
-                log.debug("Received PONG")
-                return await self.request(endpoint, timeout=timeout, **kwargs)
-
-            elif recv.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                self._connected = False
-                log.warning("WebSocket connection closed unexpectedly")
-
-                if self.auto_reconnect and not self._closed:
-                    task = asyncio.create_task(self._handle_reconnection())
-                    self._active_tasks.add(task)
-                    await task
-                    if self.connected:
-                        return await self.request(endpoint, timeout=timeout, **kwargs)
-
-                raise NotConnected("WebSocket connection closed")
-
-            elif recv.type == aiohttp.WSMsgType.ERROR:
-                raise ServerConnectionRefusedError(
-                    self.host, self.port or self.multicast_port, f"WebSocket error: {recv.data}"
-                )
-
-            response = recv.json()
-            log.debug("Received response: %r", response)
-
+            
+            # Wait for response with timeout
+            response = await asyncio.wait_for(future, timeout=actual_timeout)
+            
+            # Process response
             if isinstance(response, dict) and "error" in response:
                 error_code = response.get("code", 500)
                 error_msg = response["error"]
@@ -404,18 +418,20 @@ class Client:
             return response
 
         except asyncio.TimeoutError:
+            # Clean up pending request
+            self._pending_requests.pop(request_id, None)
             log.error("Request timeout after %ss for endpoint: %s", actual_timeout, endpoint)
             raise ConnectionTimeout(actual_timeout, f"request to {endpoint}")
+            
         except aiohttp.ClientError as e:
+            # Clean up pending request
+            self._pending_requests.pop(request_id, None)
             self._connected = False
             log.error("Client error during request: %s", e)
 
             if self.auto_reconnect and not self._closed:
                 task = asyncio.create_task(self._handle_reconnection())
                 self._active_tasks.add(task)
-                await task
-                if self.connected:
-                    return await self.request(endpoint, timeout=timeout, **kwargs)
 
             raise ServerConnectionRefusedError(self.host, self.port or self.multicast_port, str(e))
 
