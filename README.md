@@ -1,4 +1,9 @@
 # pycord-ipc
+[![PyPI](https://img.shields.io/pypi/v/pycord-inter-process.svg)](https://pypi.org/project/pycord-inter-process/)
+[![downloads](https://img.shields.io/pypi/dm/pycord-inter-process.svg)](https://pypi.org/project/pycord-inter-process/)
+[![Python](https://img.shields.io/pypi/pyversions/pycord-inter-process.svg)](https://pypi.org/project/pycord-inter-process/)
+[![License](https://img.shields.io/github/license/ParrotXray/pycord-ipc.svg)](https://github.com/ParrotXray/pycord-ipc/blob/main/LICENSE)
+
 A pycord extension for inter-process communication.
 
 # Installation 
